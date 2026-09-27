@@ -17,7 +17,7 @@ let shaderSource = """
   }
 
   fragment float4 fragment_main() {
-      return float4(0.55, 0.75, 0.95, 1.0); // light blue (your favorite!)
+      return float4(0.55, 0.75, 0.95, 1.0); // light blue
   }
   """
 
@@ -34,46 +34,62 @@ func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_fl
   )
 }
 
-// ---------- App boilerplate ----------
+// ---------- Renderer ----------
 @MainActor
 final class CubeRenderer: NSObject, MTKViewDelegate {
   let device: MTLDevice
   let commandQueue: MTLCommandQueue
   let pipeline: MTLRenderPipelineState
+  let depthState: MTLDepthStencilState
   let vertexBuffer: MTLBuffer
   let indexBuffer: MTLBuffer
   var uniforms: MTLBuffer
 
-  var angle: Float = 0
+  // Camera state (orbit camera around origin)
+  var yaw: Float = 0.5
+  var pitch: Float = 0.4
+  var distance: Float = 3.0
 
   init?(view: MTKView) {
     guard let device = MTLCreateSystemDefaultDevice(),
       let queue = device.makeCommandQueue()
     else { return nil }
 
+    // Compile shaders
     guard let library = try? device.makeLibrary(source: shaderSource, options: nil),
       let vertexFn = library.makeFunction(name: "vertex_main"),
       let fragmentFn = library.makeFunction(name: "fragment_main")
     else {
-      fatalError("Shader compilation failed")
+      fatalError("Shader compilation failed.")
     }
 
+    // Vertex descriptor matching VertexIn
     let vd = MTLVertexDescriptor()
     vd.attributes[0].format = .float3
     vd.attributes[0].offset = 0
     vd.attributes[0].bufferIndex = 0
     vd.layouts[0].stride = MemoryLayout<SIMD3<Float>>.stride
 
+    // Pipeline
     let desc = MTLRenderPipelineDescriptor()
     desc.vertexFunction = vertexFn
     desc.fragmentFunction = fragmentFn
     desc.vertexDescriptor = vd
     desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+    desc.depthAttachmentPixelFormat = .depth32Float
     guard let pipe = try? device.makeRenderPipelineState(descriptor: desc) else {
-      fatalError("Pipeline creation failed")
+      fatalError("Pipeline creation failed.")
     }
 
-    // Cube geometry (24 verts for face normals later, 36 indices)
+    // Depth stencil state
+    let depthDesc = MTLDepthStencilDescriptor()
+    depthDesc.depthCompareFunction = .less
+    depthDesc.isDepthWriteEnabled = true
+    guard let depthState = device.makeDepthStencilState(descriptor: depthDesc) else {
+      fatalError("Depth state creation failed.")
+    }
+
+    // Cube geometry
     let s: Float = 0.5
     let vertices: [SIMD3<Float>] = [
       // front (z+)
@@ -98,6 +114,7 @@ final class CubeRenderer: NSObject, MTKViewDelegate {
     self.device = device
     self.commandQueue = queue
     self.pipeline = pipe
+    self.depthState = depthState
     self.vertexBuffer = device.makeBuffer(
       bytes: vertices, length: MemoryLayout<SIMD3<Float>>.stride * vertices.count)!
     self.indexBuffer = device.makeBuffer(
@@ -106,18 +123,35 @@ final class CubeRenderer: NSObject, MTKViewDelegate {
 
     view.device = device
     view.depthStencilPixelFormat = .depth32Float
-    view.clearColor = MTLClearColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 1)
+    view.clearColor = MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)  // black
     super.init()
     view.delegate = self
+  }
+
+  // Camera controls
+  func rotateCamera(dx: Float, dy: Float) {
+    yaw += dx * 0.01
+    pitch += dy * 0.01
+    pitch = max(-1.5, min(1.5, pitch))
+  }
+
+  func zoomCamera(delta: Float) {
+    distance -= delta * 0.01
+    distance = max(0.5, min(20, distance))
   }
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
   func draw(in view: MTKView) {
-    angle += 0.01
+    // Presentation mode.
+    yaw += 0.01
 
-    let model = simd_float4x4(rotationY: angle)
-    let viewMat = simd_float4x4(translationZ: -3.0)
+    // Camera: orbit around origin
+    let model = matrix_identity_float4x4
+    let viewMat =
+      simd_float4x4(translationZ: -distance)
+      * simd_float4x4(rotationX: -pitch)
+      * simd_float4x4(rotationY: -yaw)
     let proj = perspective(
       fovY: 65 * .pi / 180,
       aspect: Float(view.drawableSize.width / view.drawableSize.height),
@@ -132,6 +166,7 @@ final class CubeRenderer: NSObject, MTKViewDelegate {
     else { return }
 
     enc.setRenderPipelineState(pipeline)
+    enc.setDepthStencilState(depthState)
     enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
     enc.setVertexBuffer(uniforms, offset: 0, index: 1)
     enc.drawIndexedPrimitives(
@@ -144,7 +179,14 @@ final class CubeRenderer: NSObject, MTKViewDelegate {
   }
 }
 
+// ---------- Matrix extensions ----------
 extension simd_float4x4 {
+  init(rotationX angle: Float) {
+    let c = cos(angle)
+    let s = sin(angle)
+    self = simd_float4x4(
+      SIMD4(1, 0, 0, 0), SIMD4(0, c, s, 0), SIMD4(0, -s, c, 0), SIMD4(0, 0, 0, 1))
+  }
   init(rotationY angle: Float) {
     let c = cos(angle)
     let s = sin(angle)
@@ -173,8 +215,85 @@ window.center()
 window.makeKeyAndOrderFront(nil)
 
 guard let renderer = MainActor.assumeIsolated({ CubeRenderer(view: mtkView) }) else {
-  fatalError("Metal unavailable")
+  fatalError("Metal unavailable.")
 }
 
+// ---------- Mouse input: orbit + zoom ----------
+var lastMouseLocation: NSPoint?
+
+NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) {
+  event in
+  switch event.type {
+  case .leftMouseDown:
+    lastMouseLocation = NSEvent.mouseLocation
+  case .leftMouseDragged:
+    let current = NSEvent.mouseLocation
+    if let last = lastMouseLocation {
+      renderer.rotateCamera(
+        dx: -Float(current.x - last.x),
+        dy: Float(current.y - last.y))
+    }
+    lastMouseLocation = current
+  case .leftMouseUp:
+    lastMouseLocation = nil
+  default:
+    break
+  }
+  return event
+}
+
+NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+  renderer.zoomCamera(delta: Float(event.scrollingDeltaY))
+  return event
+}
+
+NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+  if event.modifierFlags.contains(.command) {
+    switch event.charactersIgnoringModifiers {
+    case "q":
+      app.terminate(nil)
+    case "c":
+      window.center()
+    case nil, .some:
+      break
+    }
+  }
+  return event
+}
+
+// ---------- Extension: menu-action compatible centering ----------
+extension NSWindow {
+  @objc func centerMenuAction(_ sender: Any?) {
+    center()
+  }
+}
+
+// ---------- Menu bar (needed for Cmd+Q and shortcuts) ----------
+let mainMenu = NSMenu()
+
+let appMenuItem = NSMenuItem()
+let appMenu = NSMenu()
+appMenu.addItem(
+  withTitle: "Quit Metal Cube",
+  action: #selector(NSApplication.terminate(_:)),
+  keyEquivalent: "q")
+appMenuItem.submenu = appMenu
+mainMenu.addItem(appMenuItem)
+
+// Window menu (Cmd+W — close window, standard macOS behavior)
+let windowMenuItem = NSMenuItem()
+let windowMenu = NSMenu(title: "Window")
+windowMenu.addItem(
+  withTitle: "Close",
+  action: #selector(NSWindow.performClose(_:)),
+  keyEquivalent: "w")
+windowMenu.addItem(
+  withTitle: "Center",
+  action: #selector(NSWindow.centerMenuAction(_:)),
+  keyEquivalent: "c")
+windowMenuItem.submenu = windowMenu
+mainMenu.addItem(windowMenuItem)
+
 app.activate(ignoringOtherApps: true)
+app.mainMenu = mainMenu
 app.run()
